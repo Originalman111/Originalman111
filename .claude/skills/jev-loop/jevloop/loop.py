@@ -476,13 +476,18 @@ def run(
                 action = compose_action(answers, snapshot, limits)
 
             sigma = snapshot["realised_vol_short"] or 0.001
+            inventory_frac = max(
+                -1.0,
+                min(1.0, snapshot["inventory"] * mid / limits.max_position_usd),
+            )
             bid_px, ask_px = quote_prices(
                 mid=mid,
-                inventory=snapshot["inventory"],
+                inventory_frac=inventory_frac,
                 sigma=sigma,
                 gamma=limits.as_gamma,
                 kappa=limits.as_kappa,
                 time_left_s=limits.as_horizon_s,
+                tick_size=spec.tick_size,
             )
 
             # ladder
@@ -786,29 +791,39 @@ def _execute_action(
 
     if action.kind in (QUOTE_BOTH_SIDES, QUOTE_WIDE):
         fill_qty, fill_price = None, None
-        buy_qty = size_order(quote_notional, bid_px, spec)
-        sell_qty = size_order(quote_notional, ask_px, spec)
         # Gas-honesty rule: only cancel-replace every `rest_ticks` ticks.
         rest_counter += 1
         if resting_quotes is None or rest_counter >= limits.rest_ticks:
+            sides, skipped = _quote_sides(
+                spec, inv, mid, bid_px, ask_px, quote_notional, limits
+            )
+            skip_txt = f" ({'; '.join(skipped)})" if skipped else ""
+            quote_txt = (
+                " / ".join(f"{sd} {q} @ {px:,.2f}" for sd, q, px in sides)
+                or "no sides"
+            )
             if dry:
-                resting_quotes = {"bid": bid_px, "ask": ask_px}
+                resting_quotes = _resting(sides)
                 rest_counter = 0
-                fill_txt = f"dry: would quote {buy_qty}/{sell_qty} @ {bid_px:,.2f}/{ask_px:,.2f}"
+                fill_txt = f"dry: would quote {quote_txt}{skip_txt}"
             else:
-                # Note: this account cannot short. A sell quote placed with
-                # no inventory to back it is a real, expected rejection on a
-                # cash account, caught as an AlpacaAPIError below.
                 try:
                     if resting_quotes:
                         alpaca.cancel_own_orders()
-                    inv.orders_submitted += 2
-                    for side_, qty_, px_ in (("buy", buy_qty, bid_px), ("sell", sell_qty, ask_px)):
+                        resting_quotes = None
+                    rest_counter = 0
+                    placed = []
+                    for side_, qty_, px_ in sides:
+                        inv.orders_submitted += 1
                         o = alpaca.submit_limit_order(side_, qty_, px_)
+                        # Track each order as soon as it exists, so a
+                        # rejection on the next side can never orphan it.
+                        placed.append((side_, qty_, px_))
+                        resting_quotes = _resting(placed)
                         if expected_px is not None and o.get("client_order_id"):
                             expected_px[o["client_order_id"]] = px_
-                    resting_quotes = {"bid": bid_px, "ask": ask_px}
-                    rest_counter = 0
+                    if skipped:
+                        fill_txt = "; ".join(skipped)
                 except MarketClosedError as exc:
                     return (
                         f"{line_action} ({exc})",
@@ -819,6 +834,7 @@ def _execute_action(
                         rest_counter,
                     )
                 except AlpacaAPIError as exc:
+                    inv.orders_rejected += 1
                     return (
                         f"{line_action} (order error: {exc})",
                         fill_txt,
@@ -834,15 +850,21 @@ def _execute_action(
             # run built (never more than Alpaca says is held) and does
             # nothing when flat.
             line_action = f"{action.kind} skew {action.skew:+.1f} + sell leg"
-            own = max(inv.inventory, 0.0)
+            # A resting ask already reserves part of the holding.
+            offered = (resting_quotes or {}).get("sell_qty", 0.0)
+            own = max(inv.inventory - offered, 0.0)
             if own <= 0:
-                fill_txt = ("dry: " if dry else "") + "no position to close"
+                fill_txt = ("dry: " if dry else "") + (
+                    "long already offered on the resting ask"
+                    if inv.inventory > 0
+                    else "no position to close"
+                )
             elif dry:
                 fill_txt = f"dry: would close long {own}"
                 line_action += " (dry)"
             else:
                 try:
-                    held = max(alpaca.get_position_qty(), 0.0)
+                    held = max(alpaca.get_position_qty() - offered, 0.0)
                     step = 10 ** spec.qty_precision
                     qty = math.floor(round(min(own, held) * step, 6)) / step
                     if qty <= 0:
@@ -862,7 +884,18 @@ def _execute_action(
             side = "buy" if action.direction_leg == "up" else "sell"
             fill_px = bid_px if side == "sell" else ask_px
             leg_qty = size_order(directional_notional, fill_px, spec)
-            if dry:
+            # Resting bids count against the position cap as if filled.
+            exposure_usd = abs(inv.inventory) * mid + (resting_quotes or {}).get(
+                "buy_usd", 0.0
+            )
+            if side == "buy" and exposure_usd + leg_qty * fill_px > limits.max_position_usd:
+                fill_txt = (
+                    f"buy leg skipped: ${exposure_usd:,.2f} held or bid plus "
+                    f"${leg_qty * fill_px:,.2f} would pass the "
+                    f"${limits.max_position_usd:,.2f} position cap"
+                )
+                line_action = f"{action.kind} skew {action.skew:+.1f}"
+            elif dry:
                 fill_txt = f"dry: would {side} {leg_qty} @ {fill_px:,.2f}"
                 line_action = (
                     f"{action.kind} skew {action.skew:+.1f} + {side} leg (dry)"
@@ -888,6 +921,68 @@ def _execute_action(
         return line_action, fill_txt, fill_qty, fill_price, resting_quotes, rest_counter
 
     return line_action, fill_txt, None, None, resting_quotes, rest_counter
+
+
+def _quote_sides(
+    spec: AssetSpec,
+    inv: InventoryState,
+    mid: float,
+    bid_px: float,
+    ask_px: float,
+    quote_notional: float,
+    limits: Limits,
+) -> tuple[list[tuple[str, float, float]], list[str]]:
+    """Which sides of a two-sided quote can actually be placed, and why any
+    side was left out.
+
+    Buy: only while the position plus this bid stays under the dollar
+    position cap, so resting bids can never add up past it before risk.py
+    sees a fill. Sell: on an account that cannot short, only what this run
+    holds, and only if that clears the venue's minimum order. Quoting a
+    sell with nothing held is a guaranteed rejection, not a quote."""
+    sides: list[tuple[str, float, float]] = []
+    skipped: list[str] = []
+
+    buy_qty = size_order(quote_notional, bid_px, spec)
+    position_usd = abs(inv.inventory) * mid
+    if position_usd + buy_qty * bid_px > limits.max_position_usd:
+        skipped.append(
+            f"bid skipped: ${position_usd:,.2f} held + ${buy_qty * bid_px:,.2f} "
+            f"would pass the ${limits.max_position_usd:,.2f} position cap"
+        )
+    else:
+        sides.append(("buy", buy_qty, bid_px))
+
+    sell_qty = size_order(quote_notional, ask_px, spec)
+    if not spec.shorting_allowed:
+        step = 10**spec.qty_precision
+        held = math.floor(round(max(inv.inventory, 0.0) * step, 6)) / step
+        sell_qty = min(sell_qty, held)
+    if sell_qty <= 0:
+        skipped.append("ask skipped: nothing held to sell (long or flat only)")
+    elif sell_qty * ask_px < spec.min_notional_usd:
+        skipped.append(
+            f"ask skipped: {sell_qty} held is under the "
+            f"${spec.min_notional_usd:,.2f} minimum order"
+        )
+    else:
+        sides.append(("sell", sell_qty, ask_px))
+    return sides, skipped
+
+
+def _resting(placed: list[tuple[str, float, float]]) -> dict | None:
+    """What this run has resting on the book, or None if nothing is."""
+    if not placed:
+        return None
+    rq: dict = {"buy_usd": 0.0, "sell_qty": 0.0}
+    for side, qty, px in placed:
+        if side == "buy":
+            rq["bid"] = px
+            rq["buy_usd"] += qty * px
+        else:
+            rq["ask"] = px
+            rq["sell_qty"] += qty
+    return rq
 
 
 def _seconds_to_bar_close(now: float, bar_seconds: float, settle: float = BAR_SETTLE_S) -> float:

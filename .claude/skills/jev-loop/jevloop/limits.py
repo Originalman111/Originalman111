@@ -44,9 +44,9 @@ class Limits:
     )
     reduce_size_factor: float = 0.5  # order size multiplier while on the REDUCE rung
 
-    # --- pricing.py (Avellaneda-Stoikov) ---
+    # --- pricing.py (Avellaneda-Stoikov, run in basis points of mid) ---
     as_gamma: float = 0.10  # risk aversion
-    as_kappa: float = 1.5  # order book liquidity / arrival-rate parameter
+    as_kappa: float = 1.5  # order arrival decay per bp: 1.29 bp liquidity half spread
     as_horizon_s: float = 60.0  # T - t, the inventory-clearing horizon in seconds
 
     # --- execution/alpaca.py ---
